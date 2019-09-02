@@ -256,6 +256,24 @@ class KuduContext(val kuduMaster: String, sc: SparkContext, val socketReadTimeou
   }
 
   /**
+   * Inserts a row of a [[Row]] into a Kudu table.
+   *
+   * @param data the data to insert
+   * @param dataSchema from data to insert
+   * @param tableName the Kudu table to insert into
+   * @param writeOptions the Kudu write options
+   */
+  def insertRow(
+      data: Row,
+      dataSchema: StructType,
+      tableName: String,
+      writeOptions: KuduWriteOptions = new KuduWriteOptions): Unit = {
+    log.info(s"inserting into table '$tableName'")
+    writeRow(data, dataSchema, tableName, Insert, writeOptions)
+    log.info(s"inserted ${numInserts.value} rows into table '$tableName'")
+  }
+
+  /**
    * Inserts the rows of a [[DataFrame]] into a Kudu table, ignoring any new
    * rows that have a primary key conflict with existing rows.
    *
@@ -293,6 +311,24 @@ class KuduContext(val kuduMaster: String, sc: SparkContext, val socketReadTimeou
   }
 
   /**
+   * Upserts a row of a [[Row]] into a Kudu table.
+   *
+   * @param data the data to upsert into Kudu
+   * @param dataSchema schema from data to upsert
+   * @param tableName the Kudu table to upsert into
+   * @param writeOptions the Kudu write options
+   */
+  def upsertRow(
+      data: Row,
+      dataSchema: StructType,
+      tableName: String,
+      writeOptions: KuduWriteOptions = new KuduWriteOptions): Unit = {
+    log.info(s"upserting into table '$tableName'")
+    writeRow(data, dataSchema, tableName, Upsert, writeOptions)
+    log.info(s"upserted ${numUpserts.value} rows into table '$tableName'")
+  }
+
+  /**
    * Updates a Kudu table with the rows of a [[DataFrame]].
    *
    * @param data the data to update into Kudu
@@ -305,6 +341,24 @@ class KuduContext(val kuduMaster: String, sc: SparkContext, val socketReadTimeou
       writeOptions: KuduWriteOptions = new KuduWriteOptions): Unit = {
     log.info(s"updating rows in table '$tableName'")
     writeRows(data, tableName, Update, writeOptions)
+    log.info(s"updated ${numUpdates.value} rows in table '$tableName'")
+  }
+
+  /**
+   * Updates a Kudu table with the row of a [[Row]].
+   *
+   * @param data the data to update into Kudu
+   * @param dataSchema schema from data to update
+   * @param tableName the Kudu table to update
+   * @param writeOptions the Kudu write options
+   */
+  def updateRow(
+      data: Row,
+      dataSchema: StructType,
+      tableName: String,
+      writeOptions: KuduWriteOptions = new KuduWriteOptions): Unit = {
+    log.info(s"updating rows in table '$tableName'")
+    writeRow(data, dataSchema, tableName, Update, writeOptions)
     log.info(s"updated ${numUpdates.value} rows in table '$tableName'")
   }
 
@@ -322,6 +376,25 @@ class KuduContext(val kuduMaster: String, sc: SparkContext, val socketReadTimeou
       writeOptions: KuduWriteOptions = new KuduWriteOptions): Unit = {
     log.info(s"deleting rows from table '$tableName'")
     writeRows(data, tableName, Delete, writeOptions)
+    log.info(s"deleted ${numDeletes.value} rows from table '$tableName'")
+  }
+
+  /**
+   * Delete the row of a [[Row]] from a Kudu table.
+   *
+   * @param data the data to delete from Kudu
+   *             note that only the key columns should be specified for deletes
+   * @param dataSchema schema from data to delete
+   * @param tableName The Kudu tabe to delete from
+   * @param writeOptions the Kudu write options
+   */
+  def deleteRow(
+      data: Row,
+      dataSchema: StructType,
+      tableName: String,
+      writeOptions: KuduWriteOptions = new KuduWriteOptions): Unit = {
+    log.info(s"deleting rows from table '$tableName'")
+    writeRow(data, dataSchema, tableName, Delete, writeOptions)
     log.info(s"deleted ${numDeletes.value} rows from table '$tableName'")
   }
 
@@ -368,6 +441,55 @@ class KuduContext(val kuduMaster: String, sc: SparkContext, val socketReadTimeou
         }
       }
     })
+    log.info(s"completed $operation ops: duration histogram: $durationHistogram")
+  }
+
+  private[kudu] def writeRow(
+      data: Row,
+      dataSchema: StructType,
+      tableName: String,
+      operation: OperationType,
+      writeOptions: KuduWriteOptions = new KuduWriteOptions) {
+    val schema = dataSchema
+    // Get the client's last propagated timestamp on the driver.
+    val lastPropagatedTimestamp = syncClient.getLastPropagatedTimestamp
+
+    /*
+    // Convert to an RDD and map the InternalRows to Rows.
+    // This avoids any corruption as reported in SPARK-26880.
+    var rdd = data.queryExecution.toRdd.mapPartitions { rows =>
+      val table = syncClient.openTable(tableName)
+      val converter = new RowConverter(table.getSchema, schema, writeOptions.ignoreNull)
+      rows.map(converter.toRow)
+    }
+
+    if (writeOptions.repartition) {
+      rdd = repartitionRows(rdd, tableName, schema, writeOptions)
+    }
+
+    val table = syncClient.openTable(tableName)
+    val converter = new RowConverter(table.getSchema, schema, writeOptions.ignoreNull)
+    data.map(converter.toRow)
+
+    // Write the rows for each Spark partition.
+    rdd.foreachPartition(iterator => {
+     *
+     */
+    val pendingErrors =
+      writePartitionRow(data, schema, tableName, operation, lastPropagatedTimestamp, writeOptions)
+    if (pendingErrors.getRowErrors.nonEmpty) {
+      val errors = pendingErrors.getRowErrors
+      val sample = errors.take(5).map(_.getErrorStatus).mkString
+      if (pendingErrors.isOverflowed) {
+        throw new RuntimeException(
+          s"PendingErrors overflowed. Failed to write at least ${errors.length} rows " +
+            s"to Kudu; Sample errors: $sample")
+      } else {
+        throw new RuntimeException(
+          s"Failed to write ${errors.length} rows to Kudu; Sample errors: $sample")
+      }
+    }
+    //})
     log.info(s"completed $operation ops: duration histogram: $durationHistogram")
   }
 
@@ -447,6 +569,46 @@ class KuduContext(val kuduMaster: String, sc: SparkContext, val socketReadTimeou
         session.apply(operation)
         numRows += 1
       }
+    } finally {
+      session.close()
+      // Update timestampAccumulator with the client's last propagated
+      // timestamp on each executor.
+      timestampAccumulator.add(syncClient.getLastPropagatedTimestamp)
+      addForOperation(numRows, opType)
+      val elapsedTime = System.currentTimeMillis() - startTime
+      durationHistogram.add(elapsedTime)
+      log.info(s"applied $numRows ${opType}s to table '$tableName' in ${elapsedTime}ms")
+    }
+    session.getPendingErrors
+  }
+
+  private def writePartitionRow(
+      row: Row,
+      schema: StructType,
+      tableName: String,
+      opType: OperationType,
+      lastPropagatedTimestamp: Long,
+      writeOptions: KuduWriteOptions): RowErrorsAndOverflowStatus = {
+    // Since each executor has its own KuduClient, update executor's propagated timestamp
+    // based on the last one on the driver.
+    syncClient.updateLastPropagatedTimestamp(lastPropagatedTimestamp)
+    val table = syncClient.openTable(tableName)
+    val rowConverter = new RowConverter(table.getSchema, schema, writeOptions.ignoreNull)
+    val session: KuduSession = syncClient.newSession
+    session.setFlushMode(FlushMode.AUTO_FLUSH_BACKGROUND)
+    session.setIgnoreAllDuplicateRows(writeOptions.ignoreDuplicateRowErrors)
+    var numRows = 0
+    log.info(s"applying operations of type '${opType.toString}' to table '$tableName'")
+    val startTime = System.currentTimeMillis()
+    try {
+      if (captureRows) {
+        rowsAccumulator.add(row)
+      }
+      val partialRow = rowConverter.toPartialRow(row)
+      val operation = opType.operation(table)
+      operation.setRow(partialRow)
+      session.apply(operation)
+      numRows += 1
     } finally {
       session.close()
       // Update timestampAccumulator with the client's last propagated
